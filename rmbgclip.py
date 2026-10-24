@@ -1,86 +1,230 @@
 """
-rmbgclip - remove image backgrounds straight from the Windows clipboard.
+rmbgclip - remove image backgrounds straight from the Windows clipboard (tray app).
 
-Watches the clipboard. When an image is copied, it is run through RMBG-1.4
-(fp16 ONNX), the cut-out (transparent PNG) is put back on the clipboard, and a
-Windows toast notification is shown.
+Lives in the system tray. When an image is copied, it is run through RMBG-1.4,
+the transparent cut-out is put back on the clipboard, and a toast is shown.
+
+Tray menu:
+    * Automatic background removal  (on/off - when off, you are asked each time)
+    * Model quality                 (High / Medium / Low)
+    * Set custom model URL...       (any RMBG-compatible .onnx URL or local path)
+    * Quit
 
 Install:
-    pip install onnxruntime pillow numpy pywin32 winotify
+    pip install onnxruntime pillow numpy pywin32 winotify pystray
     (optional GPU: pip install onnxruntime-directml  -- instead of onnxruntime)
 
-Usage:
-    python rmbgclip.py            # keep running, process every copied image
-    python rmbgclip.py --once     # process the image currently on the clipboard, then exit
-    pythonw rmbgclip.py           # run silently in the background (no console window)
+Run:
+    pythonw rmbgclip.py      # no console window
+    python  rmbgclip.py      # with console (for debugging)
 """
 
-import argparse
 import ctypes
+import hashlib
 import io
+import json
 import os
-import sys
+import re
+import threading
 import time
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 import numpy as np
 import onnxruntime as ort
+import pystray
 import win32clipboard
-from PIL import Image, ImageGrab
+from PIL import Image, ImageDraw, ImageGrab
+from pystray import Menu, MenuItem
 from winotify import Notification
 
-MODEL_URL = "https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model_fp16.onnx"
-MODEL_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "rmbgclip"
-MODEL_PATH = MODEL_DIR / "model_fp16.onnx"
-MODEL_SIZE = (1024, 1024)
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tif", ".tiff"}
 APP_ID = "rmbgclip"
+MODEL_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "rmbgclip"
+CONFIG_PATH = MODEL_DIR / "config.json"
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+HF = "https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/"
+QUALITY_LEVELS = {
+    # key: (menu label, url)
+    "high": ("High (slow, highest quality)", HF + "model.onnx"),
+    "medium": ("Medium (recommended)", HF + "model_fp16.onnx"),
+    "low": ("Low (fastest, smallest)", HF + "model_quantized.onnx"),
+}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tif", ".tiff"}
+DEFAULT_CONFIG = {"auto": True, "quality": "medium", "custom_url": ""}
 
 
 # --------------------------------------------------------------------------- #
-# Model
+# Config
 # --------------------------------------------------------------------------- #
-def ensure_model() -> Path:
-    if MODEL_PATH.exists():
-        return MODEL_PATH
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading RMBG-1.4 (fp16) to {MODEL_PATH} ...")
-    tmp = MODEL_PATH.with_suffix(".part")
-
-    def progress(blocks, block_size, total):
-        if total > 0:
-            pct = min(100, blocks * block_size * 100 // total)
-            print(f"\r  {pct}%", end="", flush=True)
-
-    urllib.request.urlretrieve(MODEL_URL, tmp, progress)
-    tmp.replace(MODEL_PATH)
-    print("\nDownload complete.")
-    return MODEL_PATH
+_cfg_lock = threading.Lock()
 
 
-def load_session() -> ort.InferenceSession:
-    preferred = ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"]
-    available = ort.get_available_providers()
-    providers = [p for p in preferred if p in available] or ["CPUExecutionProvider"]
-    return ort.InferenceSession(str(ensure_model()), providers=providers)
+def load_config() -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+    except Exception:
+        pass
+    if cfg["quality"] not in QUALITY_LEVELS:
+        cfg["quality"] = DEFAULT_CONFIG["quality"]
+    return cfg
 
 
+def save_config() -> None:
+    with _cfg_lock:
+        try:
+            CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        except Exception as e:
+            print(f"Could not save config: {e}")
+
+
+cfg = load_config()
+
+
+# --------------------------------------------------------------------------- #
+# Notifications / dialogs
+# --------------------------------------------------------------------------- #
+def notify(message: str) -> None:
+    try:
+        Notification(app_id=APP_ID, title="rmbgclip", msg=message, duration="short").show()
+    except Exception as e:
+        print(f"(notification failed: {e}) {message}")
+
+
+def message_box(text: str, style: int) -> int:
+    # 0x40000 = MB_TOPMOST, 0x10000 = MB_SETFOREGROUND
+    return ctypes.windll.user32.MessageBoxW(0, text, "rmbgclip", style | 0x40000 | 0x10000)
+
+
+def ask_remove_background() -> bool:
+    MB_YESNO, MB_ICONQUESTION, IDYES = 0x4, 0x20, 6
+    return message_box(
+        "An image was copied to the clipboard.\n\nRemove its background?",
+        MB_YESNO | MB_ICONQUESTION,
+    ) == IDYES
+
+
+def ask_custom_url(initial: str):
+    """Returns the entered string, or None if cancelled."""
+    import tkinter as tk
+    from tkinter import simpledialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        return simpledialog.askstring(
+            "rmbgclip - custom model",
+            "URL of an RMBG-compatible .onnx model (or a local file path).\n"
+            "Leave empty to go back to the quality presets.",
+            initialvalue=initial,
+            parent=root,
+        )
+    finally:
+        root.destroy()
+
+
+# --------------------------------------------------------------------------- #
+# Model management
+# --------------------------------------------------------------------------- #
+def current_source() -> str:
+    return cfg["custom_url"] or QUALITY_LEVELS[cfg["quality"]][1]
+
+
+def current_model_label() -> str:
+    if cfg["custom_url"]:
+        return "Custom"
+    return QUALITY_LEVELS[cfg["quality"]][0].split(" (")[0]
+
+
+def normalize_url(url: str) -> str:
+    if "huggingface.co" in url:
+        url = url.replace("/blob/", "/resolve/")
+    return url
+
+
+def ensure_local(src: str) -> Path:
+    """Maps a URL/path to a local file, downloading it if necessary."""
+    if not re.match(r"^https?://", src, re.I):
+        p = Path(src).expanduser()
+        if not p.is_file():
+            raise FileNotFoundError(f"Model file not found: {p}")
+        return p
+
+    url = normalize_url(src)
+    name = Path(urlparse(url).path).name or "model.onnx"
+    if url in (u for _, u in QUALITY_LEVELS.values()):
+        dest = MODEL_DIR / name
+    else:
+        dest = MODEL_DIR / f"custom_{hashlib.sha1(url.encode()).hexdigest()[:10]}_{name}"
+
+    if dest.exists():
+        return dest
+
+    notify(f"Downloading model {name} ...")
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    req = urllib.request.Request(url, headers={"User-Agent": "rmbgclip"})
+    with urllib.request.urlopen(req) as resp, open(tmp, "wb") as f:
+        while chunk := resp.read(1024 * 1024):
+            f.write(chunk)
+    tmp.replace(dest)
+    return dest
+
+
+class ModelManager:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._session = None
+        self._source = None
+
+    def get(self) -> ort.InferenceSession:
+        with self._lock:
+            src = current_source()
+            if self._session is None or self._source != src:
+                path = ensure_local(src)
+                preferred = ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"]
+                available = ort.get_available_providers()
+                providers = [p for p in preferred if p in available] or ["CPUExecutionProvider"]
+                self._session = ort.InferenceSession(str(path), providers=providers)
+                self._source = src
+            return self._session
+
+
+model = ModelManager()
+
+
+def preload_model(announce: bool) -> None:
+    def work():
+        try:
+            model.get()
+            if announce:
+                notify(f"Model ready: {current_model_label()}")
+        except Exception as e:
+            notify(f"Could not load model: {e}")
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+# --------------------------------------------------------------------------- #
+# Background removal
+# --------------------------------------------------------------------------- #
 def remove_background(session: ort.InferenceSession, img: Image.Image) -> Image.Image:
-    """Returns an RGBA image with the background made transparent."""
     rgb = img.convert("RGB")
     inp = session.get_inputs()[0]
 
-    # Preprocess: resize to 1024x1024, scale to [0,1], subtract 0.5 (std = 1.0)
-    resized = rgb.resize(MODEL_SIZE, Image.BILINEAR)
-    arr = np.asarray(resized, dtype=np.float32) / 255.0 - 0.5
+    # Use the model's fixed input size if it has one (RMBG-1.4 = 1024x1024)
+    h, w = 1024, 1024
+    if len(inp.shape) == 4 and isinstance(inp.shape[2], int) and isinstance(inp.shape[3], int):
+        h, w = inp.shape[2], inp.shape[3]
+
+    arr = np.asarray(rgb.resize((w, h), Image.BILINEAR), dtype=np.float32) / 255.0 - 0.5
     arr = arr.transpose(2, 0, 1)[None, ...]
     arr = arr.astype(np.float16 if "float16" in inp.type else np.float32)
 
     out = session.run(None, {inp.name: arr})[0]
     mask = np.squeeze(out).astype(np.float32)
-
-    # Postprocess: min-max normalise, resize back to the original size
     mask = (mask - mask.min()) / (mask.max() - mask.min() + 1e-8)
     mask_img = Image.fromarray((mask * 255).astype(np.uint8)).resize(rgb.size, Image.BILINEAR)
 
@@ -90,22 +234,20 @@ def remove_background(session: ort.InferenceSession, img: Image.Image) -> Image.
 
 
 # --------------------------------------------------------------------------- #
-# Clipboard helpers
+# Clipboard
 # --------------------------------------------------------------------------- #
 def clipboard_seq() -> int:
     return ctypes.windll.user32.GetClipboardSequenceNumber()
 
 
 def get_clipboard_image():
-    """Returns a PIL image if the clipboard holds an image, else None."""
     try:
         data = ImageGrab.grabclipboard()
     except Exception:
-        return None  # clipboard briefly locked by another app, etc.
-
+        return None
     if isinstance(data, Image.Image):
         return data
-    if isinstance(data, list) and data:  # copied image *files* in Explorer
+    if isinstance(data, list) and data:  # image files copied in Explorer
         p = Path(data[0])
         if p.suffix.lower() in IMAGE_EXTS:
             try:
@@ -116,12 +258,10 @@ def get_clipboard_image():
 
 
 def set_clipboard_image(img: Image.Image) -> None:
-    """Puts the image on the clipboard as PNG (keeps transparency) + DIB (fallback)."""
+    """PNG (keeps transparency) + DIB flattened on white (fallback)."""
     png_buf = io.BytesIO()
     img.save(png_buf, "PNG")
-    png_bytes = png_buf.getvalue()
 
-    # Fallback for apps that only understand DIB: flatten onto white
     flat = Image.new("RGB", img.size, (255, 255, 255))
     flat.paste(img, mask=img.getchannel("A"))
     bmp_buf = io.BytesIO()
@@ -129,8 +269,7 @@ def set_clipboard_image(img: Image.Image) -> None:
     dib_bytes = bmp_buf.getvalue()[14:]  # strip BITMAPFILEHEADER
 
     png_fmt = win32clipboard.RegisterClipboardFormat("PNG")
-
-    for attempt in range(10):
+    for _ in range(10):
         try:
             win32clipboard.OpenClipboard()
             break
@@ -138,56 +277,23 @@ def set_clipboard_image(img: Image.Image) -> None:
             time.sleep(0.1)
     else:
         raise RuntimeError("Could not open the clipboard")
-
     try:
         win32clipboard.EmptyClipboard()
         win32clipboard.SetClipboardData(win32clipboard.CF_DIB, dib_bytes)
-        win32clipboard.SetClipboardData(png_fmt, png_bytes)
+        win32clipboard.SetClipboardData(png_fmt, png_buf.getvalue())
     finally:
         win32clipboard.CloseClipboard()
 
 
 # --------------------------------------------------------------------------- #
-# Notification
+# Clipboard watcher thread
 # --------------------------------------------------------------------------- #
-def notify(message: str) -> None:
-    try:
-        Notification(app_id=APP_ID, title="rmbgclip", msg=message, duration="short").show()
-    except Exception as e:
-        print(f"(notification failed: {e})")
+stop_event = threading.Event()
 
 
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
-def process(session, img) -> None:
-    t0 = time.time()
-    result = remove_background(session, img)
-    set_clipboard_image(result)
-    print(f"Done in {time.time() - t0:.2f}s")
-    notify("Background removed successfully")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Remove image backgrounds from the clipboard with RMBG-1.4")
-    parser.add_argument("--once", action="store_true", help="process the current clipboard image and exit")
-    parser.add_argument("--interval", type=float, default=0.4, help="clipboard poll interval in seconds")
-    args = parser.parse_args()
-
-    session = load_session()
-
-    if args.once:
-        img = get_clipboard_image()
-        if img is None:
-            print("No image on the clipboard.")
-            sys.exit(1)
-        process(session, img)
-        return
-
-    print("rmbgclip running - copy an image to remove its background. Ctrl+C to quit.")
+def watch_clipboard() -> None:
     last_seq = clipboard_seq()  # ignore whatever is on the clipboard right now
-
-    while True:
+    while not stop_event.is_set():
         try:
             seq = clipboard_seq()
             if seq != last_seq:
@@ -195,15 +301,114 @@ def main() -> None:
                 time.sleep(0.15)  # let the copying app finish writing
                 img = get_clipboard_image()
                 if img is not None:
-                    process(session, img)
-                    last_seq = clipboard_seq()  # don't re-process our own output
-            time.sleep(args.interval)
-        except KeyboardInterrupt:
-            break
+                    if cfg["auto"] or ask_remove_background():
+                        result = remove_background(model.get(), img)
+                        set_clipboard_image(result)
+                        notify("Background removed successfully")
+                    last_seq = clipboard_seq()  # don't react to our own output
         except Exception as e:
             print(f"Error: {e}")
+            notify(f"Background removal failed: {e}")
             last_seq = clipboard_seq()
             time.sleep(1)
+        stop_event.wait(0.4)
+
+
+# --------------------------------------------------------------------------- #
+# Tray
+# --------------------------------------------------------------------------- #
+def make_icon_image(active: bool) -> Image.Image:
+    size, cell = 64, 8
+    im = Image.new("RGBA", (size, size), (255, 255, 255, 255))
+    d = ImageDraw.Draw(im)
+    for y in range(0, size, cell):  # transparency checkerboard
+        for x in range(0, size, cell):
+            if (x // cell + y // cell) % 2 == 0:
+                d.rectangle((x, y, x + cell - 1, y + cell - 1), fill=(205, 205, 205, 255))
+    color = (46, 160, 67, 255) if active else (120, 120, 120, 255)
+    d.ellipse((14, 14, 50, 50), fill=color, outline=(255, 255, 255, 255), width=3)
+    return im
+
+
+def refresh_icon(icon: pystray.Icon) -> None:
+    icon.icon = make_icon_image(cfg["auto"])
+    icon.title = f"rmbgclip - auto {'ON' if cfg['auto'] else 'OFF'} - {current_model_label()}"
+    icon.update_menu()
+
+
+def toggle_auto(icon, item):
+    cfg["auto"] = not cfg["auto"]
+    save_config()
+    refresh_icon(icon)
+
+
+def quality_item(key: str) -> MenuItem:
+    label = QUALITY_LEVELS[key][0]
+
+    def choose(icon, item):
+        cfg["quality"] = key
+        cfg["custom_url"] = ""  # picking a preset replaces any custom model
+        save_config()
+        refresh_icon(icon)
+        preload_model(announce=True)
+
+    return MenuItem(
+        label,
+        choose,
+        checked=lambda item: not cfg["custom_url"] and cfg["quality"] == key,
+        radio=True,
+    )
+
+
+def set_custom_url(icon, item):
+    def work():
+        value = ask_custom_url(cfg["custom_url"])
+        if value is None:  # cancelled
+            return
+        value = value.strip()
+        if value and not re.match(r"^https?://", value, re.I) and not Path(value).expanduser().is_file():
+            message_box("That is neither an http(s) URL nor an existing file.", 0x10)  # MB_ICONERROR
+            return
+        cfg["custom_url"] = value
+        save_config()
+        refresh_icon(icon)
+        preload_model(announce=True)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def quit_app(icon, item):
+    stop_event.set()
+    icon.stop()
+
+
+def main() -> None:
+    menu = Menu(
+        MenuItem(lambda item: f"Model: {current_model_label()}", None, enabled=False),
+        Menu.SEPARATOR,
+        MenuItem("Automatic background removal", toggle_auto, checked=lambda item: cfg["auto"]),
+        MenuItem(
+            "Model quality level",
+            Menu(*(quality_item(k) for k in QUALITY_LEVELS)),
+        ),
+        MenuItem(
+            "Set custom model URL...",
+            set_custom_url,
+            checked=lambda item: bool(cfg["custom_url"]),
+        ),
+        Menu.SEPARATOR,
+        MenuItem("Quit", quit_app),
+    )
+
+    icon = pystray.Icon(APP_ID, make_icon_image(cfg["auto"]), "rmbgclip", menu)
+
+    def setup(icon):
+        icon.visible = True
+        refresh_icon(icon)
+        preload_model(announce=False)  # download/load the model up front
+        threading.Thread(target=watch_clipboard, daemon=True).start()
+
+    icon.run(setup)
 
 
 if __name__ == "__main__":
