@@ -63,6 +63,32 @@ bash deploy_to_surge_sh.sh
 ###
 -->
 
+# the slop prompted used
+```
+
+write a python script "rmbgclip" that reads when the windows clipboard has a image copied into clipboard
+
+runs the image through RMBG-1.4
+the copies the resulting image to the clipboard, and shows a windows notification "background removed sucessfully"
+
+link to quantized version https://huggingface.co/briaai/RMBG-1.4/blob/main/onnx/model_fp16.onnx
+
+add a windows tray. with options
+"automatic remove background on off" prompts the user each time if off
+
+"set custom rmbg model url"
+"change model quality level"
+high (slow, highest quality) https://huggingface.co/briaai/RMBG-1.4/blob/main/onnx/model.onnx
+medium (recommended) https://huggingface.co/briaai/RMBG-1.4/blob/main/onnx/model_quantized.onnx
+low https://huggingface.co/briaai/RMBG-1.4/blob/main/onnx/model_quantized.onnx
+
+show optional GPU in the system try opions
+
+
+
+write a command for PyInstaller (bundle the medium model inside the exe) one standalone exe
+
+```
 --------------
 # Contributors
 
