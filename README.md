@@ -3,17 +3,20 @@
 [![Open Source Love svg2](https://badges.frapsoft.com/os/v2/open-source.svg?v=103)](https://github.com/ellerbrock/open-source-badges/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 
-<!-- <img src="NNNNNN" width="400"> -->
+<img src="image-2.png" width="400">
 
 
-<h2 align="center">____________________</h2>
+<h2 align="center">Removes background from images in your clipboard. fast and local!</h2>
 
-<h4 align="center">________________________</h4>
+<h4 align="center"> super great when using with photoshop or other creative work where its kinda annoying to remove backgrounds, this makes it AUTOMAGICLY </h4>
+<h4 align="center">
+WARNING this app contains SLOPWARE CODE, it works really well. just thought you should know before downloaded 😇</h4>
 
 ---
 ![alt text](image.png)
 
 # Installation
+# go to he 
 ### 
 ```bash
 cd ~
@@ -33,6 +36,8 @@ cd rmbgclip
 # Screenshots
 - <img src="NNNNNN" width="400"> 
 ![alt text](image-1.png)
+# how to select model quality level
+![alt text](image-3.png)
 
 -------------- 
 # Development
@@ -43,12 +48,7 @@ pip install pyinstaller
 mkdir models
 curl -L -o models\model_fp16.onnx https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model_fp16.onnx
 
-pyinstaller --noconfirm --onefile --windowed --name rmbgclip ^
-  --add-data "models\model_fp16.onnx;models" ^
-  --collect-all onnxruntime ^
-  --hidden-import pystray._win32 ^
-  --hidden-import win32clipboard ^
-  rmbgclip.py
+pyinstaller --noconfirm --onefile --windowed --name rmbgclip --add-data "models\model_fp16.onnx;models" --collect-all onnxruntime --hidden-import pystray._win32 --hidden-import win32clipboard rmbgclip.py
 ```
 <!-- 
 
