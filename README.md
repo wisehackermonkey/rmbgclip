@@ -29,17 +29,28 @@ cd rmbgclip
 ### -  *[License](#License)*
 
 
-<!-- 
 --------------
 # Screenshots
 - <img src="NNNNNN" width="400"> 
- 
+![alt text](image-1.png)
 
 -------------- 
 # Development
 ### 
 ```bash
+pip install pyinstaller
+
+mkdir models
+curl -L -o models\model_fp16.onnx https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model_fp16.onnx
+
+pyinstaller --noconfirm --onefile --windowed --name rmbgclip ^
+  --add-data "models\model_fp16.onnx;models" ^
+  --collect-all onnxruntime ^
+  --hidden-import pystray._win32 ^
+  --hidden-import win32clipboard ^
+  rmbgclip.py
 ```
+<!-- 
 
 # Deployment to surge.sh
 ### 

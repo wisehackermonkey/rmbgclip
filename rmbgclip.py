@@ -17,6 +17,11 @@ Install:
 Run:
     pythonw rmbgclip.py      # no console window
     python  rmbgclip.py      # with console (for debugging)
+
+Build a single standalone exe (Medium model bundled inside):
+    pip install pyinstaller
+    curl -L -o model_fp16.onnx https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model_fp16.onnx
+    pyinstaller --onefile --noconsole --name rmbgclip --add-data "model_fp16.onnx;models" --hidden-import pystray._win32 rmbgclip.py
 """
 
 import ctypes
@@ -25,6 +30,7 @@ import io
 import json
 import os
 import re
+import sys
 import threading
 import time
 import urllib.request
@@ -52,7 +58,37 @@ QUALITY_LEVELS = {
     "low": ("Low (fastest, smallest)", HF + "model_quantized.onnx"),
 }
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tif", ".tiff"}
-DEFAULT_CONFIG = {"auto": True, "quality": "medium", "custom_url": ""}
+DEFAULT_CONFIG = {"auto": True, "quality": "medium", "custom_url": "", "device": "auto"}
+
+# key: (menu label, onnxruntime provider or None for "pick best")
+DEVICES = {
+    "auto": ("Auto (best available)", None),
+    "cpu": ("CPU", "CPUExecutionProvider"),
+    "dml": ("GPU - DirectML (any DirectX 12 GPU)", "DmlExecutionProvider"),
+    "cuda": ("GPU - NVIDIA CUDA", "CUDAExecutionProvider"),
+}
+PROVIDER_NAMES = {
+    "CPUExecutionProvider": "CPU",
+    "DmlExecutionProvider": "GPU (DirectML)",
+    "CUDAExecutionProvider": "GPU (CUDA)",
+}
+
+
+def device_available(key: str) -> bool:
+    provider = DEVICES[key][1]
+    return provider is None or provider in ort.get_available_providers()
+
+
+def providers_for(device: str) -> list:
+    available = ort.get_available_providers()
+    wanted = DEVICES.get(device, DEVICES["auto"])[1]
+    if wanted == "CPUExecutionProvider":
+        return ["CPUExecutionProvider"]
+    if wanted and wanted in available:
+        return [wanted, "CPUExecutionProvider"]
+    # auto (or the chosen GPU is no longer installed): best available
+    preferred = ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"]
+    return [p for p in preferred if p in available] or ["CPUExecutionProvider"]
 
 
 # --------------------------------------------------------------------------- #
@@ -69,6 +105,8 @@ def load_config() -> dict:
         pass
     if cfg["quality"] not in QUALITY_LEVELS:
         cfg["quality"] = DEFAULT_CONFIG["quality"]
+    if cfg["device"] not in DEVICES:
+        cfg["device"] = DEFAULT_CONFIG["device"]
     return cfg
 
 
@@ -160,6 +198,12 @@ def ensure_local(src: str) -> Path:
     else:
         dest = MODEL_DIR / f"custom_{hashlib.sha1(url.encode()).hexdigest()[:10]}_{name}"
 
+    # Model bundled inside the PyInstaller exe (see build command at the top)
+    if getattr(sys, "frozen", False):
+        bundled = Path(sys._MEIPASS) / "models" / name
+        if bundled.is_file():
+            return bundled
+
     if dest.exists():
         return dest
 
@@ -177,18 +221,32 @@ class ModelManager:
     def __init__(self):
         self._lock = threading.RLock()
         self._session = None
-        self._source = None
+        self._key = None
+        self.active = ""  # human-readable device the loaded model runs on
+
+    def _make_session(self, path: Path, providers: list) -> ort.InferenceSession:
+        opts = ort.SessionOptions()
+        if providers[0] == "DmlExecutionProvider":  # required by DirectML
+            opts.enable_mem_pattern = False
+            opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        return ort.InferenceSession(str(path), sess_options=opts, providers=providers)
 
     def get(self) -> ort.InferenceSession:
         with self._lock:
-            src = current_source()
-            if self._session is None or self._source != src:
-                path = ensure_local(src)
-                preferred = ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"]
-                available = ort.get_available_providers()
-                providers = [p for p in preferred if p in available] or ["CPUExecutionProvider"]
-                self._session = ort.InferenceSession(str(path), providers=providers)
-                self._source = src
+            key = (current_source(), cfg["device"])
+            if self._session is None or self._key != key:
+                path = ensure_local(key[0])
+                providers = providers_for(key[1])
+                try:
+                    session = self._make_session(path, providers)
+                except Exception as e:
+                    if providers == ["CPUExecutionProvider"]:
+                        raise
+                    notify(f"GPU unavailable, using CPU instead ({str(e)[:100]})")
+                    session = self._make_session(path, ["CPUExecutionProvider"])
+                self._session = session
+                self._key = key
+                self.active = PROVIDER_NAMES.get(session.get_providers()[0], "CPU")
             return self._session
 
 
@@ -200,7 +258,7 @@ def preload_model(announce: bool) -> None:
         try:
             model.get()
             if announce:
-                notify(f"Model ready: {current_model_label()}")
+                notify(f"Model ready: {current_model_label()} on {model.active}")
         except Exception as e:
             notify(f"Could not load model: {e}")
 
@@ -360,6 +418,28 @@ def quality_item(key: str) -> MenuItem:
     )
 
 
+def device_item(key: str) -> MenuItem:
+    label = DEVICES[key][0]
+
+    def choose(icon, item):
+        cfg["device"] = key
+        save_config()
+        refresh_icon(icon)
+        preload_model(announce=True)  # reloads the model on the new device
+
+    return MenuItem(label, choose, checked=lambda item: cfg["device"] == key, radio=True)
+
+
+def build_device_menu() -> Menu:
+    items = [device_item(k) for k in DEVICES if device_available(k)]
+    if not any(DEVICES[k][1] in ("DmlExecutionProvider", "CUDAExecutionProvider") and device_available(k)
+               for k in DEVICES):
+        items.append(Menu.SEPARATOR)
+        items.append(MenuItem("No GPU provider installed", None, enabled=False))
+        items.append(MenuItem("(pip install onnxruntime-directml)", None, enabled=False))
+    return Menu(*items)
+
+
 def set_custom_url(icon, item):
     def work():
         value = ask_custom_url(cfg["custom_url"])
@@ -384,13 +464,18 @@ def quit_app(icon, item):
 
 def main() -> None:
     menu = Menu(
-        MenuItem(lambda item: f"Model: {current_model_label()}", None, enabled=False),
+        MenuItem(
+            lambda item: f"Model: {current_model_label()}" + (f" on {model.active}" if model.active else ""),
+            None,
+            enabled=False,
+        ),
         Menu.SEPARATOR,
         MenuItem("Automatic background removal", toggle_auto, checked=lambda item: cfg["auto"]),
         MenuItem(
             "Model quality level",
             Menu(*(quality_item(k) for k in QUALITY_LEVELS)),
         ),
+        MenuItem("Hardware acceleration", build_device_menu()),
         MenuItem(
             "Set custom model URL...",
             set_custom_url,
