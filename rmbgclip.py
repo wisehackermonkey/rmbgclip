@@ -49,6 +49,8 @@ APP_ID = "rmbgclip"
 MODEL_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "rmbgclip"
 CONFIG_PATH = MODEL_DIR / "config.json"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
+# Folder holding models bundled by PyInstaller (or a "models" folder next to the script)
+BUNDLED_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "models"
 
 HF = "https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/"
 QUALITY_LEVELS = {
@@ -194,6 +196,9 @@ def ensure_local(src: str) -> Path:
     url = normalize_url(src)
     name = Path(urlparse(url).path).name or "model.onnx"
     if url in (u for _, u in QUALITY_LEVELS.values()):
+        bundled = BUNDLED_DIR / name
+        if bundled.is_file():  # shipped inside the exe - no download needed
+            return bundled
         dest = MODEL_DIR / name
     else:
         dest = MODEL_DIR / f"custom_{hashlib.sha1(url.encode()).hexdigest()[:10]}_{name}"
@@ -435,8 +440,11 @@ def build_device_menu() -> Menu:
     if not any(DEVICES[k][1] in ("DmlExecutionProvider", "CUDAExecutionProvider") and device_available(k)
                for k in DEVICES):
         items.append(Menu.SEPARATOR)
-        items.append(MenuItem("No GPU provider installed", None, enabled=False))
-        items.append(MenuItem("(pip install onnxruntime-directml)", None, enabled=False))
+        if getattr(sys, "frozen", False):  # running as a PyInstaller exe: pip is not an option
+            items.append(MenuItem("GPU support not included in this build", None, enabled=False))
+        else:
+            items.append(MenuItem("No GPU provider installed", None, enabled=False))
+            items.append(MenuItem("(pip install onnxruntime-directml)", None, enabled=False))
     return Menu(*items)
 
 
